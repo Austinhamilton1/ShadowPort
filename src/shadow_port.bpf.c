@@ -23,6 +23,27 @@ struct {
 } shadow_ports SEC(".maps");
 
 /*
+ * This hash map maps port to either honey potted or not (0 = non/honey potted, 1 = honey potted).
+ */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, u16);
+    __type(value, u8);
+    __uint(max_entries, MAX_PORT);
+} honey_ports SEC(".maps");
+
+/*
+ * This hash map allows the user to know which port a honey pot was originally sent to.
+ * This helps the user code figure out what response to send back to the sender.
+ */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, struct conn_state_t);
+    __type(value, u16);
+    __uint(max_entries, MAX_PORT);
+} honey_lookup SEC(".maps");
+
+/*
  * Helper function to calculate 16-bit checksum.
  *
  * Arguments:
@@ -172,10 +193,40 @@ static __always_inline int send_syn_ack(struct xdp_md *ctx, struct ethhdr *eth, 
     return XDP_TX; // Send packet back out same interface
 }
 
+/*
+ * Redirect a packet to the honey pot socket.
+ *
+ * Arguments:
+ *     struct xdp_md *ctx - The current context (data/data_end).
+ *     struct iphdr *iph - IP header.
+ *     struct tcphdr *tcph - TCP header.
+ */
+static __always_inline void redirect_to_hp(struct xdp_md *ctx, struct iphdr *iph, struct tcphdr *tcph) {
+    void *data_end = (void *)(long)ctx->data_end;
+
+    // Verify packet boundaries
+    if((void *)(tcph + 1) > data_end)
+        return;
+
+    /* Need to store the original connection response for user retrieval */
+    struct conn_state_t conn = {};
+    conn.src_ip = iph->addrs.saddr;
+    conn.dst_ip = iph->addrs.daddr;
+    conn.src_port = tcph->source;
+    conn.dst_port = HONEY_PORT;
+    
+    bpf_map_update_elem(&honey_lookup, &conn, &tcph->dest, 0);
+
+    // Send to dedicated honey pot port and recalate checksum
+    tcph->dest = HONEY_PORT;
+    tcph->check = tcp_checksum(iph, tcph, data_end);
+}
+
 SEC("xdp")
-int shadow_guard(struct xdp_md *ctx) {
+int shadow_port(struct xdp_md *ctx) {
     struct event_t *e;
     u8 *is_shadowed;
+    u8 *is_honey_pot;
 
     /* Grab the Ethernet header from the packet */
     void *data = (void *)(long)ctx->data;
@@ -192,64 +243,57 @@ int shadow_guard(struct xdp_md *ctx) {
     struct iphdr *iph = (void *)(eth + 1);
     if((void *)(iph + 1) > data_end)
         return XDP_PASS;
-        
-    /* Check the protocol: log ICMP, answer TCP with SYN defined */
-    if(iph->protocol == IPPROTO_ICMP) {
-        /* Parse header from this packet */
-        struct icmphdr *icmph = (void *)(iph + 1);
-        if((void *)(icmph + 1) > data_end)
-            return XDP_PASS;
+    
+    if(iph->protocol != IPPROTO_TCP)
+        return XDP_PASS;
 
-        // Network is being pinged
-        if(icmph->type == ICMP_ECHO) {
-            e = bpf_ringbuf_reserve(&events, sizeof(struct event_t), 0);
-            if(!e)
-                return XDP_PASS;
+    /* Parse header from this packet */
+    struct tcphdr *tcph = (void *)(iph + 1);
+    if((void *)(tcph + 1) > data_end)
+        return XDP_PASS;
 
-            /* Log incoming PING request */
-            e->src_ip = iph->addrs.saddr;
-            e->dst_ip = iph->addrs.daddr;
-            e->src_port = 0;
-            e->dst_port = 0;
-            e->timestamp = bpf_ktime_get_tai_ns();
+    // Don't let outside connections connect to honey pot port directly
+    if(__builtin_bswap16(tcph->dest) == HONEY_PORT)
+        return XDP_DROP;
 
-            bpf_ringbuf_submit(e, 0);
-        }
-    } else if(iph->protocol == IPPROTO_TCP) {
-        /* Parse header from this packet */
-        struct tcphdr *tcph = (void *)(iph + 1);
-        if((void *)(tcph + 1) > data_end)
-            return XDP_PASS;
+    // Only log SYN packets (new connection attempts)
+    if(!(tcph->syn && !tcph->ack))
+        return XDP_PASS;
 
-        // Only log SYN packets (new connection attempts)
-        if(!(tcph->syn && !tcph->ack))
-            return XDP_PASS;
+    e = bpf_ringbuf_reserve(&events, sizeof(struct event_t), 0);
+    if(!e)
+        return XDP_PASS;
 
-        e = bpf_ringbuf_reserve(&events, sizeof(struct event_t), 0);
-        if(!e)
-            return XDP_PASS;
+    /* Log incoming TCP request */
+    e->conn.src_ip = iph->addrs.saddr;
+    e->conn.dst_ip = iph->addrs.daddr;
+    e->conn.src_port = __builtin_bswap16(tcph->source);
+    e->conn.dst_port = __builtin_bswap16(tcph->dest);
+    e->timestamp = bpf_ktime_get_tai_ns();
 
-        /* Log incoming TCP request */
-        e->src_ip = iph->addrs.saddr;
-        e->dst_ip = iph->addrs.daddr;
-        e->src_port = __builtin_bswap16(tcph->source);
-        e->dst_port = __builtin_bswap16(tcph->dest);
-        e->timestamp = bpf_ktime_get_tai_ns();
-
-        // Check if the port is shadowed
-        u16 dst_port = __builtin_bswap16(tcph->dest);
-        is_shadowed = bpf_map_lookup_elem(&shadow_ports, &dst_port);
-        if(is_shadowed && *is_shadowed) {
-            // Event is a shadowed port
-            e->shadow_port = 1;
-            bpf_ringbuf_submit(e, 0);
-            
-            // Send SYN-ACK response
-            return send_syn_ack(ctx, eth, iph, tcph);   
-        }
-
+    // Check if the port is shadowed
+    u16 dst_port = __builtin_bswap16(tcph->dest);
+    is_shadowed = bpf_map_lookup_elem(&shadow_ports, &dst_port);
+    if(is_shadowed && *is_shadowed) {
+        // Event is a shadowed port
+        e->shadow_type = SHADOW;
         bpf_ringbuf_submit(e, 0);
+        
+        // Send SYN-ACK response
+        return send_syn_ack(ctx, eth, iph, tcph);   
     }
+
+    // Check if the port is honey potted
+    is_honey_pot = bpf_map_lookup_elem(&honey_ports, &dst_port);
+    if(is_honey_pot && *is_honey_pot) {
+        // Event is a honey pot port
+        e->shadow_type = HONEY;
+
+        // Redirect to honey pot socket
+        redirect_to_hp(ctx, iph, tcph);
+    }
+
+    bpf_ringbuf_submit(e, 0);
 
     // Default - Let the packet through
     return XDP_PASS;
