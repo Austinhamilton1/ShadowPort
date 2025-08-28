@@ -56,13 +56,9 @@ int handle_event(void *ctx, void *data, unsigned long size) {
 
     // No port signifies the type of incoming packet is ICMP
     if(e->src_port == 0) {
-        printf("%lld - Incoming ping from %s to %s\n", e->timestamp, dst_ip, src_ip);
-    } else {
-        if(e->shadow_port) {
-            printf("%lld - Incoming SHADOW TCP connection from %s:%d to %s:%d\n", e->timestamp, src_ip, e->src_port, dst_ip, e->dst_port);
-        } else {
-            printf("%lld - Incoming TCP connection from %s:%d to %s:%d\n", e->timestamp, src_ip, e->src_port, dst_ip, e->dst_port);
-        }
+        printf("%lld - Received ping from %s to %s\n", e->timestamp, dst_ip, src_ip);
+    } else if(e->shadow_port) {
+        printf("%lld - Received SHADOW TCP connection from %s:%d to %s:%d\n", e->timestamp, src_ip, e->src_port, dst_ip, e->dst_port);
     }
 
     return 0;
