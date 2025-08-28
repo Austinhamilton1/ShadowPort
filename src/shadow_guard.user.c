@@ -111,7 +111,7 @@ int main(int argc, char **argv) {
     /* Find the XDP program by name */
     prog = bpf_object__find_program_by_name(obj, "shadow_port");
     if(!prog) {
-        fprintf(stderr, "Error: XDP program 'shadow_port' not found in objet file\n");
+        fprintf(stderr, "Error: XDP program 'shadow_guard' not found in objet file\n");
         err = -1;
         goto cleanup;
     }
@@ -131,7 +131,7 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    printf("Successfully attached ShadowPort to %s (ifindex: %d)\n", ifname, ifindex);
+    printf("Successfully attached ShadowGuard to %s (ifindex: %d)\n", ifname, ifindex);
     
     /* Find the events ring buffer map */
     events_map = bpf_object__find_map_by_name(obj, "events");
@@ -158,7 +158,7 @@ int main(int argc, char **argv) {
     }
 
     printf("Events buffer created successfully\n");
-    printf("ShadowPort is now monitoring for connection attempts...\n");
+    printf("ShadowGuard is now monitoring for connection attempts...\n");
     printf("Press Ctrl-C to detach and exit...\n");
 
     while(running) {
@@ -173,7 +173,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    printf("Exiting main loop, starting cleanup...\n");
+    printf("\nExiting main loop, starting cleanup...\n");
 
 cleanup:
     // Clean up ring buffer

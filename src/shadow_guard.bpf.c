@@ -62,8 +62,73 @@ static __always_inline __u16 ip_checksum(struct iphdr *iph) {
     return csum_fold(csum);
 }
 
+/*
+ * Calculate TCP checksum (includes pseudo header).
+ * 
+ * Arguments:
+ *     struct iphdr *ip - The ip header.
+ *     struct tcphdr *tcp - The tcp header.
+ *     void *data_end - Always have to check against data_end.
+ * Returns:
+ *     __u16 - A checksum for a TCP packet.
+ */
+static __always_inline __u16 tcp_checksum(struct iphdr *iph, struct tcphdr *tcph, 
+                                          void *data_end) {
+    __u32 csum = 0;
+    __u16 tcp_len;
+    
+    // Calculate TCP segment length
+    tcp_len = __builtin_bswap16(iph->tot_len) - (iph->ihl << 2);
+    
+    // Clear existing checksum
+    tcph->check = 0;
+    
+    // Add pseudo header (source IP, dest IP, protocol, TCP length)
+    csum += (iph->saddr & 0xffff) + (iph->saddr >> 16);
+    csum += (iph->daddr & 0xffff) + (iph->daddr >> 16);
+    csum += __builtin_bswap16(IPPROTO_TCP);
+    csum += __builtin_bswap16(tcp_len);
+    
+    // Add TCP header and data
+    __u16 *data = (__u16 *)tcph;
+    void *tcp_end = (void *)tcph + tcp_len;
+    
+    // Ensure we don't read past packet boundary
+    if (tcp_end > data_end)
+        tcp_end = data_end;
+    
+    // Sum TCP header and data in 16-bit chunks
+    while ((void *)data < tcp_end) {
+        if ((void *)(data + 1) <= tcp_end) {
+            csum += *data++;
+        } else {
+            // Handle odd byte at end
+            csum += (*(__u8 *)data) << 8;
+            break;
+        }
+    }
+    
+    return csum_fold(csum);
+}
+
+/*
+ * Send a TCP SYN ACK back to the incoming connection.
+ * 
+ * Arguments:
+ *     struct xdp_md *ctx - The current context (data/data_end).
+ *     struct iphdr *iph - IP header.
+ *     struct tcphdr *tcph - TCP header.
+ * Returns:
+ *     int XDP_TX (success) or XDP_PASS (failure).
+ */
+static __always_inline int send_syn_ack(struct xdp_md *ctx, struct iphdr *iph, struct tcphdr *tcph) {
+    void *data_end = (void *)(long)ctx->data_end;
+
+    if((void *))
+}
+
 SEC("xdp")
-int shadow_port(struct xdp_md *ctx) {
+int shadow_guard(struct xdp_md *ctx) {
     struct event_t *e;
 
     /* Grab the Ethernet header from the packet */
