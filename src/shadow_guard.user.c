@@ -58,7 +58,11 @@ int handle_event(void *ctx, void *data, unsigned long size) {
     if(e->src_port == 0) {
         printf("%lld - Incoming ping from %s to %s\n", e->timestamp, dst_ip, src_ip);
     } else {
-        printf("%lld - Incoming TCP connection from %s:%d to %s:%d\n", e->timestamp, src_ip, e->src_port, dst_ip, e->dst_port);
+        if(e->shadow_port) {
+            printf("%lld - Incoming SHADOW TCP connection from %s:%d to %s:%d\n", e->timestamp, src_ip, e->src_port, dst_ip, e->dst_port);
+        } else {
+            printf("%lld - Incoming TCP connection from %s:%d to %s:%d\n", e->timestamp, src_ip, e->src_port, dst_ip, e->dst_port);
+        }
     }
 
     return 0;
@@ -69,13 +73,20 @@ int main(int argc, char **argv) {
     struct bpf_program *prog;       // BPF program
     struct bpf_map *events_map;     // Map for ring buffer
     struct ring_buffer *rb = NULL;  // Ring buffer
+    struct bpf_map *shadow_map;     // Hash map
     static int ifindex = 0;         // Interface index
     int prog_fd;                    // fd of the program
     int events_fd;                  // fd of the ring buffer
     int err;                        // Error code
+    int shadow_ports[MAX_PORT];     // Ports to shadow
+    
+    // Initialize shadow_ports
+    for(int i = 0; i < MAX_PORT; i++) {
+        shadow_ports[i] = -1;
+    }
 
-    if(argc != 3) {
-        fprintf(stderr, "Usage: %s <interface> <xdp_program.o>\n", argv[0]);
+    if(argc < 3 || argc != 5) {
+        fprintf(stderr, "Usage: %s <interface> <xdp_program.o> [:--shadow <port1,port2,...>]\n", argv[0]);
         return 1;
     }
 
@@ -109,7 +120,7 @@ int main(int argc, char **argv) {
     libbpf_set_print(libbpf_print_fn);
 
     /* Find the XDP program by name */
-    prog = bpf_object__find_program_by_name(obj, "shadow_port");
+    prog = bpf_object__find_program_by_name(obj, "shadow_guard");
     if(!prog) {
         fprintf(stderr, "Error: XDP program 'shadow_guard' not found in objet file\n");
         err = -1;
@@ -158,9 +169,64 @@ int main(int argc, char **argv) {
     }
 
     printf("Events buffer created successfully\n");
+
+    /* Add shadow ports */
+    if(argc == 5) {
+        if(strcmp(argv[3], "--shadow")) {
+            fprintf(stderr, "Error: Invalid argument '%s'\n", argv[3]);
+            err = -1;
+            goto cleanup;
+        }
+
+        /* Split the port string into individual ports */
+        char *port_str = argv[4];
+        const char *delimiter = ",";
+
+        char *token;
+        int port;
+
+        // Get first port
+        int idx = 0;
+        token = strtok(port_str, delimiter);
+        port = atoi(token);
+        if(port >= 0 && port < MAX_PORT)
+            shadow_ports[idx++] = port;
+
+        // Get subsequent ports in a loop
+        while(idx < MAX_PORT && (token = strtok(NULL, delimiter)) != NULL) {
+            port = atoi(token);
+            if(port >= 0 && port < MAX_PORT)
+                shadow_ports[idx++] = port;
+        }
+    }
+
+    /* Find the shadow ports map */
+    shadow_map = bpf_object__find_map_by_name(obj, "shadow_ports");
+    if(!shadow_map) {
+        fprintf(stderr, "Error: Could not find 'shadow_ports' map in BPF object\n");
+        err = -1;
+        goto cleanup;
+    }    
+
+    /* Add shadow ports to BPF program */
+    for(int i = 0; i < MAX_PORT; i++) {
+        // -1 indicates end of list
+        if(shadow_ports[i] == -1) break;
+
+        __u8 shadowed = 1;
+
+        err = bpf_map__update_elem(shadow_map, &shadow_ports[i], sizeof(__u16), &shadowed, sizeof(shadowed), 0);
+        if(err) {
+            fprintf(stderr, "Error: Could not add port %d to 'shadowed_port' map\n", shadow_ports[i]);
+            goto cleanup;
+        }
+    }
+
+    printf("Shadow ports initialized\n");
     printf("ShadowGuard is now monitoring for connection attempts...\n");
     printf("Press Ctrl-C to detach and exit...\n");
 
+    /* Main loop */
     while(running) {
         err = ring_buffer__poll(rb, 100);
         if(err == -EINTR) {
@@ -198,6 +264,6 @@ cleanup:
         printf("BPF object cleaned up\n");
     }
 
-    printf("ShadowPort shutdown complete\n");    
+    printf("ShadowGuard shutdown complete\n");    
     return err ? 1 : 0;
 }

@@ -19,8 +19,8 @@ struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, u16);
     __type(value, u8);
-    __uint(max_entries, 1 << 16);
-} shadowed_ports SEC(".maps");
+    __uint(max_entries, MAX_PORT);
+} shadow_ports SEC(".maps");
 
 /*
  * Helper function to calculate 16-bit checksum.
@@ -72,8 +72,7 @@ static __always_inline __u16 ip_checksum(struct iphdr *iph) {
  * Returns:
  *     __u16 - A checksum for a TCP packet.
  */
-static __always_inline __u16 tcp_checksum(struct iphdr *iph, struct tcphdr *tcph, 
-                                          void *data_end) {
+static __always_inline __u16 tcp_checksum(struct iphdr *iph, struct tcphdr *tcph, void *data_end) {
     __u32 csum = 0;
     __u16 tcp_len;
     
@@ -91,21 +90,14 @@ static __always_inline __u16 tcp_checksum(struct iphdr *iph, struct tcphdr *tcph
     
     // Add TCP header and data
     __u16 *data = (__u16 *)tcph;
-    void *tcp_end = (void *)tcph + tcp_len;
     
-    // Ensure we don't read past packet boundary
-    if (tcp_end > data_end)
-        tcp_end = data_end;
-    
-    // Sum TCP header and data in 16-bit chunks
-    while ((void *)data < tcp_end) {
-        if ((void *)(data + 1) <= tcp_end) {
-            csum += *data++;
-        } else {
-            // Handle odd byte at end
-            csum += (*(__u8 *)data) << 8;
-            break;
-        }
+    // Bounds check
+    if((void *)(data + 10) > data_end)
+        return 0; // Invalid packet
+
+    #pragma unroll
+    for(int i = 0; i < 10; i++) {
+        csum += *data++;
     }
     
     return csum_fold(csum);
@@ -116,20 +108,74 @@ static __always_inline __u16 tcp_checksum(struct iphdr *iph, struct tcphdr *tcph
  * 
  * Arguments:
  *     struct xdp_md *ctx - The current context (data/data_end).
+ *     struct ethhdr *eth - Ethernet header.
  *     struct iphdr *iph - IP header.
  *     struct tcphdr *tcph - TCP header.
  * Returns:
  *     int XDP_TX (success) or XDP_PASS (failure).
  */
-static __always_inline int send_syn_ack(struct xdp_md *ctx, struct iphdr *iph, struct tcphdr *tcph) {
+static __always_inline int send_syn_ack(struct xdp_md *ctx, struct ethhdr *eth, struct iphdr *iph, struct tcphdr *tcph) {
     void *data_end = (void *)(long)ctx->data_end;
 
-    if((void *))
+    // Verify packet boundaries
+    if((void *)(tcph + 1) > data_end)
+        return XDP_PASS;
+
+    // Save original values
+    __u32 orig_saddr = iph->addrs.saddr;
+    __u32 orig_daddr = iph->addrs.daddr;
+    __u16 orig_sport = tcph->source;
+    __u16 orig_dport = tcph->dest;
+    __u32 orig_seq = tcph->seq;
+
+    // Swap MAC addresses
+    __u8 tmp_mac[ETH_ALEN];
+    __builtin_memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
+    __builtin_memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
+    __builtin_memcpy(eth->h_source, tmp_mac, ETH_ALEN);
+
+    // Swap IP addresses
+    iph->addrs.saddr = orig_daddr;
+    iph->addrs.daddr = orig_saddr;
+
+    // Swap ports
+    tcph->source = orig_dport;
+    tcph->dest = orig_sport;
+
+    // Set TCP flags for SYN-ACK
+    tcph->syn = 1;
+    tcph->ack = 1;
+    tcph->rst = 0;
+    tcph->fin = 0;
+    tcph->psh = 0;
+    tcph->urg = 0;
+
+    // Set sequence and acknowledgement numbers
+    tcph->seq = __builtin_bswap32(0x12345678); // Random ISN for honeypot
+    tcph->ack_seq = __builtin_bswap32(__builtin_bswap32(orig_seq) + 1);
+
+    // Set window size (adversize reasonable buffer)
+    tcph->window = __builtin_bswap16(65535);
+
+    // Clear urgent pointer
+    tcph->urg_ptr = 0;
+
+    // Update IP header
+    iph->ttl = 64; // Reset TTL
+
+    // Recalculate IP checksum
+    iph->check = ip_checksum(iph);
+
+    // Recalculate TCP checksum
+    tcph->check = tcp_checksum(iph, tcph, data_end);
+
+    return XDP_TX; // Send packet back out same interface
 }
 
 SEC("xdp")
 int shadow_guard(struct xdp_md *ctx) {
     struct event_t *e;
+    u8 *is_shadowed;
 
     /* Grab the Ethernet header from the packet */
     void *data = (void *)(long)ctx->data;
@@ -190,15 +236,22 @@ int shadow_guard(struct xdp_md *ctx) {
         e->dst_port = __builtin_bswap16(tcph->dest);
         e->timestamp = bpf_ktime_get_tai_ns();
 
-        bpf_ringbuf_submit(e, 0);
-
         // Check if the port is shadowed
-        u8 is_shadowed = bpf_map_lookup_elem(&shadowed_ports, &e->dst_port);
-        if(is_shadowed) {
+        u16 dst_port = __builtin_bswap16(tcph->dest);
+        is_shadowed = bpf_map_lookup_elem(&shadow_ports, &dst_port);
+        if(is_shadowed && *is_shadowed) {
+            // Event is a shadowed port
+            e->shadow_port = 1;
+            bpf_ringbuf_submit(e, 0);
             
+            // Send SYN-ACK response
+            return send_syn_ack(ctx, eth, iph, tcph);   
         }
+
+        bpf_ringbuf_submit(e, 0);
     }
 
+    // Default - Let the packet through
     return XDP_PASS;
 }
 
