@@ -41,6 +41,7 @@ struct {
     __type(key, struct conn_state_t);
     __type(value, u16);
     __uint(max_entries, MAX_PORT);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
 } honey_lookup SEC(".maps");
 
 /*
@@ -213,12 +214,15 @@ static __always_inline void redirect_to_hp(struct xdp_md *ctx, struct iphdr *iph
     conn.src_ip = iph->addrs.saddr;
     conn.dst_ip = iph->addrs.daddr;
     conn.src_port = tcph->source;
-    conn.dst_port = HONEY_PORT;
+    conn.dst_port = __builtin_bswap16(HONEY_PORT);
     
     bpf_map_update_elem(&honey_lookup, &conn, &tcph->dest, 0);
 
     // Send to dedicated honey pot port and recalate checksum
-    tcph->dest = HONEY_PORT;
+    tcph->dest = __builtin_bswap16(HONEY_PORT);
+
+    // Update check sums
+    iph->check = ip_checksum(iph);
     tcph->check = tcp_checksum(iph, tcph, data_end);
 }
 
@@ -253,8 +257,8 @@ int shadow_port(struct xdp_md *ctx) {
         return XDP_PASS;
 
     // Don't let outside connections connect to honey pot port directly
-    if(__builtin_bswap16(tcph->dest) == HONEY_PORT)
-        return XDP_DROP;
+    //if(__builtin_bswap16(tcph->dest) == HONEY_PORT)
+    //    return XDP_DROP;
 
     // Only log SYN packets (new connection attempts)
     if(!(tcph->syn && !tcph->ack))
@@ -270,6 +274,7 @@ int shadow_port(struct xdp_md *ctx) {
     e->conn.src_port = __builtin_bswap16(tcph->source);
     e->conn.dst_port = __builtin_bswap16(tcph->dest);
     e->timestamp = bpf_ktime_get_tai_ns();
+    e->shadow_type = REGULAR;
 
     // Check if the port is shadowed
     u16 dst_port = __builtin_bswap16(tcph->dest);
@@ -297,6 +302,86 @@ int shadow_port(struct xdp_md *ctx) {
 
     // Default - Let the packet through
     return XDP_PASS;
+}
+
+/*
+ * Parse a TCP packet.
+ *
+ * Arguments:
+ *     struct __sk_buff *skb - The packet to parse.
+ *     __u64 *off_eth - Store ethernet offset here.
+ *     __u64 *off_ip - Store IP offset here.
+ *     __u64 *off_tcp - Store TCP offset here.
+ *     struct iphdr *iph - Store IP header here.
+ *     struct tcph *tcph - Store TCP header here.
+ * Returns:
+ *     int - 0 on success, -1 on failure.
+ */
+static __always_inline int parse_tcp(struct __sk_buff *skb, __u64 *off_eth, __u64 *off_ip, __u64 *off_tcp, struct iphdr *iph, struct tcphdr *tcph) {
+    __u32 eth_proto;
+    __u32 ip_off = sizeof(struct ethhdr);
+    __u32 tcp_off;
+    int ret;
+
+    /* Ensure ethernet header is available and read ethertype */
+    ret = bpf_skb_load_bytes(skb, 12, &eth_proto, sizeof(__u16)); // offset 12 = h_proto (be16)
+    if (ret < 0) return -1;
+    eth_proto = __builtin_bswap16((__u16)eth_proto);
+    if (eth_proto != ETH_P_IP) return -1;
+
+    /* Load IPv4 header first (minimum 20 bytes) */
+    ret = bpf_skb_load_bytes(skb, ip_off, iph, sizeof(struct iphdr));
+    if (ret < 0) return -1;
+
+    if (iph->protocol != IPPROTO_TCP) return -1;
+
+    /* Calculate tcp header offset from iph->ihl (ihl in 32-bit words) */
+    tcp_off = ip_off + (iph->ihl * 4);
+
+    /* Load TCP header (minimum 20 bytes) */
+    ret = bpf_skb_load_bytes(skb, tcp_off, tcph, sizeof(struct tcphdr));
+    if (ret < 0) return -1;
+
+    /* Populate out offsets for caller (if they need them) */
+    *off_eth = 0;
+    *off_ip  = ip_off;
+    *off_tcp = tcp_off;
+    return 0;
+}
+
+SEC("tc")
+int fix_header(struct __sk_buff *skb) {
+    __u64 off_eth, off_ip, off_tcp;
+    struct iphdr iph;
+    struct tcphdr tcph;
+    if(parse_tcp(skb, &off_eth, &off_ip, &off_tcp, &iph, &tcph) < 0)
+        return BPF_OK;
+
+    // Need to know if this egress packet is part of the XDP honey pot flow.
+    struct conn_state_t key = {
+        .src_ip = iph.daddr,
+        .dst_ip = iph.saddr,
+        .src_port = tcph.dest,
+        .dst_port = __builtin_bswap16(HONEY_PORT),
+    };
+
+    // Reverse lookup
+    __u16 *orig_port = bpf_map_lookup_elem(&honey_lookup, &key);
+    if(!orig_port)
+        return BPF_OK;
+
+    // Change outgoing port
+    __u16 old = tcph.source;
+    __u16 new = *orig_port;
+
+    if(bpf_skb_store_bytes(skb, off_tcp + offsetof(struct tcphdr, source), &new, sizeof(new), 0) < 0)
+        return BPF_OK;
+
+    // Adjust TCP checksum
+    if(bpf_l4_csum_replace(skb, off_tcp + offsetof(struct tcphdr, check), old, new, sizeof(new)) < 0)
+        return BPF_OK;
+
+    return BPF_OK;
 }
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
